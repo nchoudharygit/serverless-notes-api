@@ -1,0 +1,178 @@
+aws_cloudformation_template
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS CloudFormation Template for deploying a sample application.
+
+Resources:
+
+  NotesTable:                          # logical name (you make this up)
+    Type: AWS::DynamoDB::Table         # tells CloudFormation what to create
+    Properties:
+      TableName: NotesTable            # actual name in AWS
+      BillingMode: PAY_PER_REQUEST     # on-demand, no capacity planning
+      AttributeDefinitions:
+        - AttributeName: noteId        # define the key column
+          AttributeType: S             # S = String, N = Number, B = Binary
+      KeySchema:
+        - AttributeName: noteId
+          KeyType: HASH                # HASH = partition key (required)
+
+  LambdaExecutionRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: NotesApiLambdaRole
+        AssumeRolePolicyDocument:        # who is ALLOWED to use this role
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: lambda.amazonaws.com   # only Lambda can assume it
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: NotesApiPolicy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow           # allow Lambda to write logs
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource: arn:aws:logs:*:*:*
+
+                - Effect: Allow           # allow Lambda to access DynamoDB
+                  Action:
+                    - dynamodb:PutItem
+                    - dynamodb:GetItem
+                    - dynamodb:DeleteItem
+                    - dynamodb:Scan
+                  Resource: !GetAtt NotesTable.Arn   # only THIS table, not all tables
+
+  NotesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: NotesApiHandler
+      Runtime: python3.11
+      Handler: handler.lambda_handler  # filename.function_name
+      Role: !GetAtt LambdaExecutionRole.Arn   # attach the role we made
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+            return {"statusCode": 200, "body": "placeholder"}
+
+  NotesApi:                            # the REST API container
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: NotesAPI
+
+  NotesResource:                       # creates the /notes path
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref NotesApi         # !Ref = reference this resource's ID
+      ParentId: !GetAtt NotesApi.RootResourceId   # parent is /
+      PathPart: notes                  # so this becomes /notes
+
+  NoteByIdResource:                    # creates /notes/{id}
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref NotesApi
+      ParentId: !Ref NotesResource     # parent is /notes
+      PathPart: "{id}"                 # so this becomes /notes/{id}
+
+  GetNotesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref NotesApi
+      ResourceId: !Ref NotesResource   # attach to /notes
+      HttpMethod: GET
+      AuthorizationType: NONE          # public, no auth
+      Integration:
+        Type: AWS_PROXY                # pass full request to Lambda as-is
+        IntegrationHttpMethod: POST    # API GW always calls Lambda via POST internally
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Fn}/invocations
+          - Fn: !GetAtt NotesFunction.Arn
+  
+  PostNoteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref NotesApi
+      ResourceId: !Ref NotesResource   # attach to /notes
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Fn}/invocations
+          - Fn: !GetAtt NotesFunction.Arn
+  
+  DeleteNoteByIdMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref NotesApi
+      ResourceId: !Ref NoteByIdResource   # attach to /notes/{id}
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Fn}/invocations
+          - Fn: !GetAtt NotesFunction.Arn
+  
+  GetNoteByIdMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref NotesApi
+      ResourceId: !Ref NoteByIdResource   # attach to /notes/{id}
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Fn}/invocations
+          - Fn: !GetAtt NotesFunction.Arn
+
+  LambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt NotesFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${NotesApi}/*/*/*   # allow API GW to call Lambda for any method on any resource
+ 
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:                         # wait for ALL methods to exist first
+      - GetNotesMethod
+      - PostNoteMethod
+      - GetNoteByIdMethod
+      - DeleteNoteMethod
+    Properties:
+      RestApiId: !Ref NotesApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref NotesApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod                  # your URL will end with /prod
+  
+  Outputs:
+    ApiEndpoint:
+      Description: "URL of the API Gateway endpoint"
+      Value: !Sub "https://${NotesApi}.execute-api.${AWS::Region}.amazonaws.com/prod/notes"
+      Export:
+        Name: NotesApiEndpoint
+    LambdaFunctionName:
+      Description: "Name of the Lambda function"
+      Value: !Ref NotesFunction
+      Export:
+        Name: NotesLambdaFunctionName
+    DynamoDBTableName:
+      Description: "Name of the DynamoDB table"
+      Value: !Ref NotesTable
+      Export:
+        Name: NotesDynamoDBTableName
+  
